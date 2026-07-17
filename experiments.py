@@ -3,17 +3,18 @@
 Saves arrays into results/ that make_figures.py turns into the report figures.
 
 Protocols
-  E1  clean recovery showcase: dt=0.001, T=25, finite differences, lam=0.05
-  E2  noise sweep at dt=0.01: FD vs Savitzky-Golay, 20 noise draws per level
+  E1  clean recovery: dt=0.001, T=25, finite differences, lam=0.05
+  E2  noise sweep at dt=0.01: FD vs Savitzky-Golay, 50 noise draws per level
   E3a step size sweep, clean and mildly noisy (FD only)
   E3b trajectory length sweep at 1% noise (Savitzky-Golay)
   E4  threshold sweep on linear2d and lorenz, clean and 1% noise
-  E5  library degree sweep on lorenz at several noise levels
+  E5  library degree sweep on lorenz, plus the degree-2 threshold check
+  E6  Lotka-Volterra single-orbit identifiability, 100 draws
 
 The threshold rule everywhere except E1/E4: lam = half the smallest true
 coefficient of the system, so the threshold is never the thing that fails.
-Noise draws are paired across methods and sweep values (same 20 noisy
-trajectories reused), which makes comparisons cleaner.
+In E2 and E4 the same noisy trajectories are reused across methods and
+threshold values, which makes those comparisons paired.
 """
 
 import os
@@ -227,18 +228,35 @@ def e5_library():
                 med_err[li, di] = np.median(errs)
                 success[li, di] = hits / TRIALS
         print(f"  degree {deg}: {len(terms)} terms, cond(Theta)={conds[di]:.2e}")
+
+    # the degree-2 threshold check: with a smaller lam the degree-2 library
+    # recovers again, and the cliff sits where the dense fit's y coefficient is
+    restore_lams = np.array([0.2, 0.25, 0.3])
+    restore_success = np.zeros(len(restore_lams))
+    terms2 = poly_terms(3, 2)
+    Xi_true2 = true_coef_matrix(SYSTEMS["lorenz"], terms2)
+    for li, rl in enumerate(restore_lams):
+        hits = 0
+        for tr in range(TRIALS):
+            Xi, _ = fit(noisy[0.001][tr], dt, rl, "savgol", degree=2)
+            hits += support_stats(Xi, Xi_true2)["exact"]
+        restore_success[li] = hits / TRIALS
+        print(f"  degree 2, 0.1% noise, lam={rl}: exact rate {restore_success[li]:.2f}")
+
     np.savez(os.path.join(OUT, "E5.npz"), degrees=np.array(degrees),
              levels=np.array(levels), med_err=med_err, success=success,
-             conds=conds, n_lib=n_lib)
+             conds=conds, n_lib=n_lib, restore_lams=restore_lams,
+             restore_success=restore_success)
 
 
 def e6_orbit():
     """Lotka-Volterra identifiability: one closed orbit vs two.
 
-    On a single orbit the library columns {1, y} come close to spanning the
-    true dx/dt, so at low noise the solver sometimes swaps the true terms for
-    that on-orbit surrogate. A second orbit breaks the degeneracy. At higher
-    noise the failures come from derivative noise instead and stay.
+    On a single orbit the library columns become nearly interchangeable as
+    functions on the curve, so at low noise the solver either spreads an
+    equation so thin that thresholding empties it, or swaps in an on-orbit
+    surrogate. A second orbit breaks the degeneracy. At higher noise the
+    failures come from derivative noise instead and mostly stay.
     """
     print("E6: single-orbit identifiability (lotka)")
     dt = 0.01
@@ -246,18 +264,34 @@ def e6_orbit():
     t, X = simulate("lotka", T=25.0, dt=dt)
     t2, X2 = simulate("lotka", T=25.0, dt=dt, x0=[5.0, 1.0])
     lam = lam_for("lotka")
-    Xi_true = true_coef_matrix(SYSTEMS["lotka"], poly_terms(2, DEG))
+    terms = poly_terms(2, DEG)
+    Xi_true = true_coef_matrix(SYSTEMS["lotka"], terms)
 
-    # how well (1, y) explains the true dx/dt along the sampled orbit
+    # the on-orbit shadows: project each true equation onto two other columns
     x, y = X[:, 0], X[:, 1]
-    f = x - 0.5 * x * y
-    A = np.column_stack([np.ones_like(y), y])
-    proj = A @ np.linalg.lstsq(A, f, rcond=None)[0]
-    r2 = 1 - np.sum((f - proj) ** 2) / np.sum((f - f.mean()) ** 2)
+    r2 = {}
+    for name, f, cols in [("prey_on_1y", x - 0.5 * x * y, [np.ones_like(y), y]),
+                          ("pred_on_1x", -y + 0.25 * x * y, [np.ones_like(x), x])]:
+        A = np.column_stack(cols)
+        proj = A @ np.linalg.lstsq(A, f, rcond=None)[0]
+        r2[name] = 1 - np.sum((f - proj) ** 2) / np.sum((f - f.mean()) ** 2)
+
+    def failure_mode(Xi):
+        prey_ok = np.array_equal(np.nonzero(Xi[:, 0])[0], np.nonzero(Xi_true[:, 0])[0])
+        pred_ok = np.array_equal(np.nonzero(Xi[:, 1])[0], np.nonzero(Xi_true[:, 1])[0])
+        if prey_ok and not Xi[:, 1].any():
+            return "pred_empty"
+        if pred_ok and set(np.nonzero(Xi[:, 0])[0]) == {terms.index(()), terms.index((1,))}:
+            return "prey_impostor"
+        if prey_ok and set(np.nonzero(Xi[:, 1])[0]) == {terms.index(()), terms.index((0,))}:
+            return "pred_impostor"
+        return "other"
 
     levels = [1e-4, 1e-2]
     trials = 100
+    mode_names = ["pred_empty", "prey_impostor", "pred_impostor", "other"]
     fails = np.zeros((len(levels), 2))
+    modes = np.zeros((len(levels), len(mode_names)))
     for li, level in enumerate(levels):
         for tr in range(trials):
             Xn, Xn2 = add_noise(X, level, rng), add_noise(X2, level, rng)
@@ -266,15 +300,21 @@ def e6_orbit():
             A2, b2 = trim([Xn2, dX2], EDGE)
             Theta, _ = build_library(A1, DEG)
             Xi = stlsq(Theta, b1, lam)
-            fails[li, 0] += not support_stats(Xi, Xi_true)["exact"]
+            if not support_stats(Xi, Xi_true)["exact"]:
+                fails[li, 0] += 1
+                modes[li, mode_names.index(failure_mode(Xi))] += 1
             Theta2, _ = build_library(np.vstack([A1, A2]), DEG)
             Xi2 = stlsq(Theta2, np.vstack([b1, b2]), lam)
             fails[li, 1] += not support_stats(Xi2, Xi_true)["exact"]
-        print(f"  sigma={level:g}: one orbit {int(fails[li, 0])}/{trials} fail, "
+        print(f"  sigma={level:g}: one orbit {int(fails[li, 0])}/{trials} fail "
+              f"({dict(zip(mode_names, modes[li].astype(int)))}), "
               f"two orbits {int(fails[li, 1])}/{trials} fail")
     np.savez(os.path.join(OUT, "E6.npz"), levels=np.array(levels),
-             fails=fails, trials=trials, r2=r2)
-    print(f"  R^2 of dx/dt on span(1, y) along one orbit: {r2:.3f}")
+             fails=fails, trials=trials, modes=modes,
+             mode_names=np.array(mode_names),
+             r2_prey=r2["prey_on_1y"], r2_pred=r2["pred_on_1x"])
+    print(f"  R^2 of shadows: prey on (1,y) {r2['prey_on_1y']:.3f}, "
+          f"pred on (1,x) {r2['pred_on_1x']:.3f}")
 
 
 if __name__ == "__main__":

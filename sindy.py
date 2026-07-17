@@ -60,12 +60,15 @@ def true_coef_matrix(system, terms):
 
 # ---------------------------------------------------------- sparse solve
 
-def stlsq(Theta, dX, lam, max_iter=20):
+def stlsq(Theta, dX, lam, max_iter=None):
     """Sequential thresholded least squares.
 
     Fit by least squares, zero every coefficient smaller than lam, refit on
-    the surviving terms, repeat until the active set stops changing.
+    the surviving terms, repeat until the active set stops changing. The
+    active set only shrinks, so at most p iterations are ever needed.
     """
+    if max_iter is None:
+        max_iter = Theta.shape[1]
     Xi = np.linalg.lstsq(Theta, dX, rcond=None)[0]
     for _ in range(max_iter):
         active = np.abs(Xi) >= lam
